@@ -1,0 +1,214 @@
+#!/bin/bash
+
+# This script automates system maintenance tasks on Ubuntu:
+#   1. Upgrades system packages via APT
+#   2. Upgrades pip and pip packages
+#   3. Upgrades Cargo packages
+#   4. Updates tealdeer (tldr) manpages
+#   5. Removes orphaned packages
+#   6. Removes old kernels
+#   7. Cleans journal logs
+#   8. Updates Oh My Zsh
+#   9. Cleans old log files from /tmp
+#
+# A log of this script's execution is saved in /tmp/ with a timestamped filename.
+# Log files older than 7 days will be automatically cleaned up by the script.
+
+sudo true
+set -euo pipefail
+
+# Define colors for output
+GREEN="\033[1;32m"
+RED="\033[1;31m"
+BLUE="\033[1;34m"
+RESET="\033[0m"
+
+# Create a log file in /tmp/ with the current datestamp
+LOG_FILE="/tmp/log-upgrade-$(date +%Y%m%d%H%M%S).log"
+
+# Redirect stdout and stderr to the log file and the console
+exec > >(tee -a "$LOG_FILE") 2>&1
+
+# Ensure the script is run as a non-root user
+if [[ $EUID -eq 0 ]]; then
+    printf "${RED}Please run this script as a non-root user.${RESET}\n"
+    exit 1
+fi
+
+# Print a message in the specified color
+print_in_color() {
+    local color="$1"
+    local message="$2"
+    printf "%b%s%b\n" "$color" "$message" "$RESET"
+}
+
+# Print a separator line for clarity in log output
+print_separator() {
+    local cols
+    cols=$(tput cols || echo 80)
+    printf '\n'
+    printf '%*s\n' "$cols" '' | tr ' ' '-'
+}
+
+# Handle errors and exit the script gracefully
+error_exit() {
+    print_in_color "$RED" "Error: $1" >&2
+    printf "Check the log file at %s for more details.\n" "$LOG_FILE" >&2
+    exit 1
+}
+
+# Run a command and print a separator afterwards
+run_cmd() {
+    local cmd="$1"
+    print_in_color "$BLUE" "Running: $cmd"
+    if ! eval "$cmd"; then
+        error_exit "Command failed: $cmd"
+    fi
+    print_separator
+}
+
+# Ensure a command is available, exits if not found
+ensure_command() {
+    local cmd="$1"
+    if ! command -v "$cmd" &>/dev/null; then
+        error_exit "Required command '$cmd' is not installed. Please install it and rerun the script."
+    fi
+}
+
+# Verify all required commands are available
+verify_dependencies() {
+    print_in_color "$GREEN" "Verifying required commands..."
+
+    # List of required commands
+    local commands=("deborphan" "purge-old-kernels" "apt-get" "pip3" "python3" "git" "cargo" "tldr")
+    for cmd in "${commands[@]}"; do
+        ensure_command "$cmd"
+    done
+
+    print_in_color "$GREEN" "All required commands are available."
+    print_separator
+}
+
+# Upgrade system packages using APT
+upgrade_apt_packages() {
+    print_in_color "$GREEN" "Upgrading APT packages..."
+    run_cmd "sudo apt-get update"
+    run_cmd "sudo apt-get install --fix-broken -y"
+    run_cmd "sudo apt-get full-upgrade -y"
+    run_cmd "sudo apt-get autoremove -y"
+    run_cmd "sudo apt-get autoclean"
+    run_cmd "sudo apt-get clean"
+}
+
+# Upgrade pip and its packages
+upgrade_pip_packages() {
+    print_in_color "$GREEN" "Upgrading pip packages..."
+    run_cmd "pip3 install --break-system-packages --upgrade pip --user"
+
+    local pip_outdated
+    pip_outdated=$(pip3 list --outdated --format=json | python3 -c "import json, sys; packages=[pkg['name'] for pkg in json.load(sys.stdin)]; print(' '.join(packages))")
+
+    if [[ -n "$pip_outdated" ]]; then
+        print_in_color "$BLUE" "Upgrading the following pip packages:\n$pip_outdated"
+        for pkg in $pip_outdated; do
+            run_cmd "pip3 install --break-system-packages --upgrade $pkg --user"
+        done
+    else
+        print_in_color "$GREEN" "All pip packages are up-to-date."
+        print_separator
+    fi
+}
+
+# Upgrade Cargo packages
+upgrade_cargo_packages() {
+    print_in_color "$GREEN" "Upgrading Cargo packages..."
+    run_cmd "cargo install-update install-update"
+    print_in_color "$GREEN" "Cargo packages up-to-date."
+    print_separator
+}
+
+# Update tldr manpages
+update_tldr_pages() {
+    print_in_color "$GREEN" "Updating tealdeer..."
+    run_cmd "tldr --update"
+    print_in_color "$GREEN" "tealdeer manpages updated."
+    print_separator
+}
+
+# Remove orphaned packages
+remove_orphaned_packages() {
+    print_in_color "$GREEN" "Removing orphaned packages..."
+    local orphans
+    orphans=$(deborphan)
+
+    if [[ -n "$orphans" ]]; then
+        print_in_color "$BLUE" "Orphaned packages found:\n$orphans"
+        run_cmd "sudo apt-get purge -y $orphans"
+    else
+        print_in_color "$GREEN" "No orphaned packages to remove."
+        print_separator
+    fi
+}
+
+# Safely remove old kernels using purge-old-kernels
+remove_old_kernels() {
+    print_in_color "$GREEN" "Removing old kernels..."
+    run_cmd "sudo purge-old-kernels -y"
+}
+
+# Clean journal logs, limiting size to 100MB
+clean_journal_logs() {
+    print_in_color "$GREEN" "Cleaning journal logs..."
+    run_cmd "sudo journalctl --vacuum-size=100M"
+}
+
+# Update Oh My Zsh
+upgrade_oh_my_zsh() {
+    print_in_color "$GREEN" "Updating Oh My Zsh..."
+    local oh_my_zsh_dir="$HOME/.oh-my-zsh"
+
+    if [[ -d "$oh_my_zsh_dir" ]]; then
+        pushd "$oh_my_zsh_dir" >/dev/null
+        run_cmd "git pull"
+        popd >/dev/null
+    else
+        print_in_color "$GREEN" "Oh My Zsh is not installed."
+        print_separator
+    fi
+}
+
+# Clean up old log files older than 7 days in /tmp
+clean_old_logs() {
+    print_in_color "$GREEN" "Cleaning up old log files..."
+    run_cmd "sudo find /tmp/ -type f -name 'log-upgrade-*.log' -mtime +7 -exec rm {} \;"
+    print_in_color "$GREEN" "Old log files cleaned up."
+    print_separator
+}
+
+# List of steps to execute in order
+run_steps=(
+    "upgrade_apt_packages"
+    "upgrade_pip_packages"
+    "upgrade_cargo_packages"
+    "update_tldr_pages"
+    "remove_orphaned_packages"
+    "remove_old_kernels"
+    "clean_journal_logs"
+    "upgrade_oh_my_zsh"
+)
+
+# Main script execution
+main() {
+    verify_dependencies
+
+    for step in "${run_steps[@]}"; do
+        "$step"
+    done
+
+    print_in_color "$GREEN" "System update and cleanup complete!"
+    printf "Log file located at: %s\n" "$LOG_FILE"
+    clean_old_logs
+}
+
+# Invoke the main function to start the script
+main

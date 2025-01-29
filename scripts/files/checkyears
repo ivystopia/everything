@@ -1,0 +1,65 @@
+#!/usr/bin/env python
+
+# Determine whether the given two calendar years are equivalent.
+# For example, 2014 and 2025 have all the same days (Wednesday, 1st January, etc.)
+# But 2024 and 2025 do not.
+# Usage: ./checkyears.py YEAR_ONE YEAR_TWO
+# Exits:
+#   0 - Yes, the years match.
+#   1 - No, the years do not match.
+#   2 - Invalid input (wrong number of arguments, non-integer values).
+
+from datetime import date
+from datetime import timedelta
+import sys
+
+
+def is_leap_year(year: int) -> bool:
+    """Determine if a given year is a leap year."""
+    return year % 400 == 0 or (year % 4 == 0 and year % 100 != 0)
+
+
+def get_total_days_in_year(year: int) -> int:
+    """Return the total number of days in a given year."""
+    return 366 if is_leap_year(year) else 365
+
+
+def main():
+    """Compare the day-to-day weekday alignment of two years."""
+    if len(sys.argv) != 3:
+        print("Usage: ./checkyears.py YEAR_ONE YEAR_TWO")
+        sys.exit(2)
+
+    try:
+        year_one = int(sys.argv[1])
+        year_two = int(sys.argv[2])
+    except ValueError:
+        print("Invalid year format. Please provide integer values.")
+        sys.exit(2)
+
+    if get_total_days_in_year(year_one) != get_total_days_in_year(year_two):
+        print(f"Years {year_one} and {year_two} are not identical.")
+        sys.exit(1)
+
+    current_date = date(year_one, 1, 1)
+    end_date = date(year_one, 12, 31)
+    one_day = timedelta(days=1)
+
+    try:
+        while current_date <= end_date:
+            corresponding_date = date(year_two, current_date.month, current_date.day)
+            if current_date.weekday() != corresponding_date.weekday():
+                print(f"Years {year_one} and {year_two} are not identical.")
+                sys.exit(1)
+            current_date += one_day
+    except ValueError:
+        # Handle invalid dates (e.g., Feb 29 in a non-leap year)
+        print(f"Years {year_one} and {year_two} are not identical.")
+        sys.exit(1)
+
+    print(f"Years {year_one} and {year_two} are identical.")
+    sys.exit(0)
+
+
+if __name__ == "__main__":
+    main()

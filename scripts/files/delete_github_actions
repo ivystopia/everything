@@ -1,0 +1,60 @@
+#!/bin/bash
+
+REPO_OWNER="ivystopia"
+REPO_NAME="ivystopia.github.io"
+MAX_SLEEP_INTERVAL=30 # Maximum interval between checks in seconds
+
+# GITHUB_TOKEN must be set
+
+# Fetch all workflow runs
+fetch_workflow_runs() {
+    response=$(curl -s -H "Authorization: token $GITHUB_TOKEN" \
+        "https://api.github.com/repos/$REPO_OWNER/$REPO_NAME/actions/runs")
+
+    # Output the raw JSON response for debugging
+    echo "----- Raw API Response Start -----"
+    echo "$response"
+    echo "----- Raw API Response End -----"
+
+    # Proceed to extract run IDs
+    echo "$response" | jq -r '.workflow_runs[] | select(.name == "pages build and deployment") | .id'
+}
+
+# Delete an individual workflow run
+delete_workflow_run() {
+    local run_id=$1
+    curl -X DELETE -H "Authorization: token $GITHUB_TOKEN" \
+        "https://api.github.com/repos/$REPO_OWNER/$REPO_NAME/actions/runs/$run_id"
+}
+
+# Main loop
+while true; do
+
+    workflow_runs=$(fetch_workflow_runs)
+
+    if [ -z "$workflow_runs" ]; then
+        echo "No workflow runs found for deletion."
+        break
+    fi
+
+    for run_id in $workflow_runs; do
+        echo "Deleting workflow run ID: $run_id"
+        delete_workflow_run $run_id
+
+        # Verify if the workflow run was deleted
+        SLEEP_INTERVAL=1
+        while curl -s -H "Authorization: token $GITHUB_TOKEN" \
+            "https://api.github.com/repos/$REPO_OWNER/$REPO_NAME/actions/runs/$run_id" |
+            jq -e '.id' >/dev/null; do
+            echo "Workflow run ID: $run_id still exists. Retrying in $SLEEP_INTERVAL seconds..."
+            sleep $SLEEP_INTERVAL
+            delete_workflow_run $run_id
+            # Increase sleep interval up to the maximum
+            if [ $SLEEP_INTERVAL -lt $MAX_SLEEP_INTERVAL ]; then
+                SLEEP_INTERVAL=$((SLEEP_INTERVAL + 1))
+            fi
+        done
+
+        echo "Workflow run ID: $run_id has been successfully deleted."
+    done
+done

@@ -1,0 +1,165 @@
+#!/bin/bash
+
+# sync_to_s3.sh
+# Synchronizes the current local directory with an S3 bucket of the same name.
+# It uploads new or modified files, deletes files from S3 that have been removed locally,
+# and invalidates the associated CloudFront distribution if any changes occur.
+
+set -euo pipefail
+
+# Global Variables
+BUCKET_NAME="$(basename "$(pwd)")"
+BUCKET="s3://$BUCKET_NAME"
+CHANGES_MADE=false
+DRY_RUN=false
+
+# Usage Information
+usage() {
+    echo "Usage: $0 [--dry-run]"
+    echo ""
+    echo "Options:"
+    echo "  --dry-run    Show what actions would be taken without making any changes."
+    exit 1
+}
+
+# Parse Command-Line Arguments
+while [[ $# -gt 0 ]]; do
+    case $1 in
+    --dry-run)
+        DRY_RUN=true
+        shift
+        ;;
+    *)
+        usage
+        ;;
+    esac
+done
+
+# Check if the S3 bucket is accessible
+check_bucket_access() {
+    if ! aws s3 ls "$BUCKET" >/dev/null; then
+        echo "Error: Unable to access the bucket $BUCKET." >&2
+        exit 1
+    fi
+}
+
+# Calculate the MD5 hash of a local file
+get_local_etag() {
+    local filename="$1"
+    if command -v md5sum >/dev/null; then
+        md5sum "$filename" | awk '{ print $1 }'
+    else
+        md5 -q "$filename"
+    fi
+}
+
+# Upload a single file to S3 if it has changed
+upload_file() {
+    local filename="$1"
+    local key="${filename#"$PWD/"}"
+    local existing_object existing_mime_type existing_etag local_etag
+
+    if existing_object=$(aws s3api head-object --bucket "$BUCKET_NAME" --key "$key" 2>/dev/null); then
+        existing_mime_type=$(echo "$existing_object" | jq -r '.ContentType')
+        existing_etag=$(echo "$existing_object" | jq -r '.ETag' | tr -d '"')
+        local_etag=$(get_local_etag "$filename")
+
+        if [[ "$existing_etag" == "$local_etag" ]]; then
+            echo "Skipping unchanged file: $key"
+            return
+        fi
+    fi
+
+    if [[ -n "${existing_mime_type:-}" ]]; then
+        echo "Uploading $key with MIME type $existing_mime_type"
+        if [[ "$DRY_RUN" == false ]]; then
+            aws s3 cp "$filename" "$BUCKET/$key" --content-type "$existing_mime_type"
+        else
+            echo "[Dry Run] Would upload $key with MIME type $existing_mime_type"
+        fi
+    else
+        echo "Uploading $key without specifying MIME type"
+        if [[ "$DRY_RUN" == false ]]; then
+            aws s3 cp "$filename" "$BUCKET/$key"
+        else
+            echo "[Dry Run] Would upload $key without specifying MIME type"
+        fi
+    fi
+
+    CHANGES_MADE=true
+}
+
+# Upload all local files to S3 using process substitution
+upload_files() {
+    find "$(pwd)" -type f -print0 | while IFS= read -r -d '' filename; do
+        upload_file "$filename"
+    done
+}
+
+# Delete files from S3 that no longer exist locally
+delete_removed_files() {
+    echo "Retrieving list of files from S3 bucket: $BUCKET_NAME"
+
+    # List S3 files, sorted
+    mapfile -t s3_files < <(aws s3api list-objects-v2 --bucket "$BUCKET_NAME" --query 'Contents[].Key' --output text | tr '\t' '\n' | sort)
+    # List local files, sorted
+    mapfile -t local_files < <(find "$(pwd)" -type f -printf '%P\n' | sort)
+
+    # Use comm to find files present in S3 but not locally
+    files_to_delete=$(comm -23 <(printf "%s\n" "${s3_files[@]}" | sort) <(printf "%s\n" "${local_files[@]}" | sort))
+
+    if [[ -n "$files_to_delete" ]]; then
+        echo "Found files to delete from S3:"
+        echo "$files_to_delete"
+        if [[ "$DRY_RUN" == true ]]; then
+            echo "[Dry Run] The following files would be deleted from S3:"
+            echo "$files_to_delete"
+        else
+            read -p "Are you sure you want to delete these files from S3? (y/N): " confirm
+            if [[ "$confirm" =~ ^[Yy]$ ]]; then
+                while IFS= read -r file; do
+                    if [[ -n "$file" ]]; then
+                        echo "Deleting $file from S3."
+                        aws s3 rm "s3://$BUCKET_NAME/$file"
+                        CHANGES_MADE=true
+                    fi
+                done <<<"$files_to_delete"
+            else
+                echo "Deletion aborted by user."
+            fi
+        fi
+    else
+        echo "No files to delete from S3."
+    fi
+}
+
+# Invalidate the associated CloudFront distribution if changes were made
+invalidate_cloudfront() {
+    if [[ "$CHANGES_MADE" == true ]]; then
+        distribution_id=$(aws cloudfront list-distributions | jq -r --arg bucket_name "$BUCKET_NAME" \
+            '.DistributionList.Items[] | select(.Aliases.Items[]? == $bucket_name).Id')
+
+        if [[ -n "$distribution_id" ]]; then
+            echo "Creating CloudFront invalidation for distribution ID: $distribution_id"
+            if [[ "$DRY_RUN" == false ]]; then
+                aws cloudfront create-invalidation --distribution-id "$distribution_id" --paths '/*' | jq -c .
+            else
+                echo "[Dry Run] Would create CloudFront invalidation for distribution ID: $distribution_id"
+            fi
+        else
+            echo "Warning: No matching CloudFront distribution found for bucket $BUCKET_NAME." >&2
+        fi
+    else
+        echo "No changes detected. CloudFront invalidation not required."
+    fi
+}
+
+# Main execution flow
+main() {
+    check_bucket_access
+    upload_files
+    delete_removed_files
+    invalidate_cloudfront
+}
+
+main "$@"

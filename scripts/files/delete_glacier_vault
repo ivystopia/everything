@@ -1,0 +1,188 @@
+#!/bin/bash
+
+# Deletes an AWS Glacier vault, including all its archives.
+# This script deletes the specified vault even if it's not empty.
+# The process may take several hours to complete.
+
+# AWS_PROFILE must be set to specify the AWS credentials to use.
+
+# Usage:
+#   ./delete_glacier_vault.sh <VAULT_NAME>
+# Example:
+#   ./delete_glacier_vault.sh Music
+
+# TODO: Further enhance script to accept additional parameters like REGION and ACCOUNT_ID if needed.
+
+# Exit immediately if a command exits with a non-zero status
+set -e
+
+# Function to display usage instructions
+usage() {
+    echo "Usage: $0 <VAULT_NAME>"
+    echo "Example: $0 Music"
+    exit 1
+}
+
+# Check if VAULT_NAME is provided as an argument
+if [ $# -ne 1 ]; then
+    usage
+fi
+
+# Define variables
+VAULT_NAME="$1"              # Vault name is now provided as a command-line argument
+ACCOUNT_ID="-"               # Use '-' to utilize the default account ID associated with the AWS credentials
+REGION="eu-west-1"           # AWS region where the vault is located
+INVENTORY_FILE="output.json" # File to store the inventory of archives
+
+# Uncomment the following line to disable paging in AWS CLI outputs
+# export PAGER=cat
+
+# Function to log messages with timestamp
+log() {
+    echo "$(date '+%Y-%m-%d %H:%M:%S') - $1"
+}
+
+# Function to handle errors by logging and exiting
+handle_error() {
+    log "Error: $1"
+    exit 1
+}
+
+# Function to verify AWS credentials and retrieve AWS_PROFILE and Account ID
+verify_aws_identity() {
+    log "Verifying AWS credentials and account identity..."
+
+    # Retrieve AWS_PROFILE; default to "default" if not set
+    CURRENT_PROFILE="${AWS_PROFILE:-default}"
+
+    # Retrieve AWS Account ID using AWS CLI
+    AWS_ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text 2>/dev/null) || handle_error "AWS credentials not configured or invalid."
+
+    # Check if AWS_ACCOUNT_ID is empty
+    if [ -z "$AWS_ACCOUNT_ID" ]; then
+        handle_error "Unable to retrieve AWS Account ID."
+    fi
+
+    echo "============================================================"
+    echo "WARNING: You are about to delete the Glacier vault '$VAULT_NAME' and all its archives."
+    echo "This action is irreversible and will permanently remove all data within the vault."
+    echo "Your AWS_PROFILE is set to \"$CURRENT_PROFILE\""
+    echo "Your AWS account ID is $AWS_ACCOUNT_ID"
+    echo "============================================================"
+}
+
+# Verify AWS credentials and display relevant information
+verify_aws_identity
+
+# Confirmation Prompt with AWS Identity Information
+read -p "Are you sure you want to proceed? (Y/n): " confirm
+
+# Set default to 'y' if no input is provided
+confirm=${confirm:-y}
+
+# Convert input to lowercase for comparison
+confirm=${confirm,,}
+
+case $confirm in
+y | yes)
+    log "User confirmed. Proceeding with deletion."
+    ;;
+n | no)
+    log "User declined. Exiting the script."
+    exit 0
+    ;;
+*)
+    log "Invalid input. Exiting the script."
+    exit 1
+    ;;
+esac
+
+# Step 1: Initiate inventory retrieval job
+log "Initiating inventory retrieval job for vault: $VAULT_NAME..."
+JOB_ID=$(aws glacier initiate-job \
+    --account-id="$ACCOUNT_ID" \
+    --vault-name="$VAULT_NAME" \
+    --region="$REGION" \
+    --job-parameters='{"Type": "inventory-retrieval"}' \
+    --query='jobId' \
+    --output=text) || handle_error "Failed to initiate inventory retrieval job."
+
+log "Inventory retrieval job initiated with Job ID: $JOB_ID."
+
+# Step 2: Wait for the job to complete (This can take several hours)
+log "Waiting for inventory retrieval job to complete... (This might take several hours)"
+while true; do
+    STATUS=$(aws glacier describe-job \
+        --account-id="$ACCOUNT_ID" \
+        --vault-name="$VAULT_NAME" \
+        --region="$REGION" \
+        --job-id="$JOB_ID" \
+        --query='StatusCode' \
+        --output=text) || handle_error "Failed to describe job status."
+
+    if [ "$STATUS" == "Succeeded" ]; then
+        log "Inventory retrieval job completed successfully."
+        break
+    fi
+
+    log "Job status: $STATUS. Checking again in 5 minutes..."
+    sleep 300 # Wait for 5 minutes before checking the status again
+done
+
+# Step 3: Retrieve the inventory and save it to a file
+log "Retrieving inventory data..."
+aws glacier get-job-output \
+    --account-id="$ACCOUNT_ID" \
+    --vault-name="$VAULT_NAME" \
+    --region="$REGION" \
+    --job-id="$JOB_ID" \
+    "$INVENTORY_FILE" || handle_error "Failed to retrieve job output."
+
+# Step 4: Verify that the inventory file exists
+if [ ! -f "$INVENTORY_FILE" ]; then
+    handle_error "Inventory file $INVENTORY_FILE not found."
+fi
+
+# Step 5: Delete all archives listed in the inventory
+log "Deleting all archives in the vault..."
+jq -r '.ArchiveList[].ArchiveId' "$INVENTORY_FILE" | while IFS= read -r archiveId; do
+    log "Attempting to delete archive: $archiveId"
+    aws glacier delete-archive \
+        --vault-name="$VAULT_NAME" \
+        --account-id="$ACCOUNT_ID" \
+        --region="$REGION" \
+        --archive-id="$archiveId" &&
+        log "Deleted archive: $archiveId" ||
+        log "Error: Failed to delete archive: $archiveId"
+done
+
+# Step 6: Wait briefly before attempting to delete the vault
+log "Waiting for vault to be ready for deletion..."
+sleep 600 # Wait for 10 minutes
+
+# Verify that the vault is empty and ready for deletion
+while true; do
+    VAULT_STATUS=$(aws glacier describe-vault \
+        --account-id="$ACCOUNT_ID" \
+        --vault-name="$VAULT_NAME" \
+        --region="$REGION" \
+        --query='VaultName' \
+        --output=text) || handle_error "Failed to describe vault."
+
+    if [ "$VAULT_STATUS" == "$VAULT_NAME" ]; then
+        log "Vault is ready for deletion."
+        break
+    fi
+
+    log "Vault not ready for deletion. Waiting for 5 minutes..."
+    sleep 300 # Wait for 5 minutes before rechecking
+done
+
+# Step 7: Delete the vault
+log "Deleting the vault: $VAULT_NAME..."
+aws glacier delete-vault \
+    --account-id="$ACCOUNT_ID" \
+    --vault-name="$VAULT_NAME" \
+    --region="$REGION" || handle_error "Failed to delete vault."
+
+log "Vault '$VAULT_NAME' deleted successfully."

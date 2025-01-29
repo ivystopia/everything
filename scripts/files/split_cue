@@ -1,0 +1,307 @@
+#!/usr/bin/env python
+
+"""
+A script to split CUE+FLAC into multiple FLACs.
+Run it on a directory that contains a single cuesheet and a single FLAC.
+It works on one directory at a time!
+Sorry I lost the script to print out a list of target directories.
+Go ask ChatGPT.
+
+Usage: script.py <directory>
+
+What it does:
+
+- Splits the big FLAC into multiple individual FLACs, one for each track
+- Tries to name and tag the FLACs according to the cuesheet
+- Ignores any pregap for the first track
+- Does not delete the original input files, only renames them by prepending "DeleteMe-" to their filenames.
+- Once you are happy with the script outcome, you can delete the old files yourself
+"""
+
+import os
+import sys
+import logging
+from pydub import AudioSegment
+from mutagen.flac import FLAC
+import re
+
+# Ensure the necessary libraries are installed
+# pip install pydub mutagen
+
+# Configure logging
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s - %(levelname)s - %(message)s",
+)
+logger = logging.getLogger(__name__)
+
+
+def parse_cue_file(cue_file):
+    """
+    Parse the CUE file to extract album and track information.
+
+    Args:
+        cue_file (str): Path to the CUE file.
+
+    Returns:
+        tuple: Album artist, album title, album date, and a list of tracks with their number, title, and start time.
+    """
+    album_artist = None
+    album_title = None
+    album_date = None
+    tracks = []
+
+    with open(cue_file, "r", encoding="utf-8") as f:
+        lines = f.readlines()
+
+    for line in lines:
+        if line.startswith("PERFORMER"):
+            album_artist = re.search(r'"(.*?)"', line).group(1)
+        elif line.startswith("TITLE") and album_title is None:
+            album_title = re.search(r'"(.*?)"', line).group(1)
+        elif line.startswith("REM DATE"):
+            album_date = line.split(" ")[2].strip()
+
+    for i in range(len(lines)):
+        if lines[i].strip().startswith("TRACK"):
+            track_number = int(lines[i].split()[1])
+            track_title = None
+            start_time = None
+            for j in range(i, len(lines)):
+                if lines[j].strip().startswith("TITLE"):
+                    track_title = re.search(
+                        r'"(.*?)"',
+                        lines[j],
+                    ).group(1)
+                if lines[j].strip().startswith("INDEX 01"):
+                    start_time = lines[j].split()[2].strip()
+                    tracks.append(
+                        (
+                            track_number,
+                            track_title,
+                            start_time,
+                        )
+                    )
+                    break
+    return (
+        album_artist,
+        album_title,
+        album_date,
+        tracks,
+    )
+
+
+def time_to_ms(time_str):
+    """
+    Convert a time string in the format MM:SS:FF to milliseconds.
+
+    Args:
+        time_str (str): Time string.
+
+    Returns:
+        int: Time in milliseconds.
+    """
+    minutes, seconds, frames = map(int, time_str.split(":"))
+    ms = (minutes * 60 + seconds) * 1000 + (frames * 1000 // 75)
+    return ms
+
+
+def load_audio(flac_file):
+    """
+    Load the FLAC file as an audio segment.
+
+    Args:
+        flac_file (str): Path to the FLAC file.
+
+    Returns:
+        AudioSegment: Loaded audio segment.
+    """
+    return AudioSegment.from_file(flac_file, format="flac")
+
+
+def export_and_tag_track(
+    track_audio,
+    track_filename,
+    track_number,
+    track_title,
+    album_artist,
+    album_title,
+    album_date,
+):
+    """
+    Export the track audio segment as a FLAC file and tag it.
+
+    Args:
+        track_audio (AudioSegment): Audio segment of the track.
+        track_filename (str): Filename for the exported track.
+        track_number (int): Track number.
+        track_title (str): Track title.
+        album_artist (str): Album artist.
+        album_title (str): Album title.
+        album_date (str): Album date.
+    """
+    logger.debug(f"    Exporting {track_filename}...")
+    # Export the track as a FLAC file
+    track_audio.export(track_filename, format="flac")
+    logger.info(f"    Exported {track_filename}")
+
+    logger.debug(f"    Tagging {track_filename}...")
+    # Tag the FLAC file
+    flac = FLAC(track_filename)
+    flac["TITLE"] = track_title
+    flac["TRACKNUMBER"] = str(track_number)
+    flac["ARTIST"] = album_artist
+    flac["ALBUMARTIST"] = album_artist
+    flac["ALBUM"] = album_title
+    if album_date:
+        flac["DATE"] = album_date
+        flac["YEAR"] = album_date
+    flac.save()
+    logger.info(f"    Tagged {track_filename}")
+
+
+def process_tracks(
+    audio,
+    tracks,
+    album_artist,
+    album_title,
+    album_date,
+):
+    """
+    Process each track, extracting its audio segment and exporting it.
+
+    Args:
+        audio (AudioSegment): Loaded audio segment of the entire FLAC file.
+        tracks (list): List of tracks with their number, title, and start time.
+        album_artist (str): Album artist.
+        album_title (str): Album title.
+        album_date (str): Album date.
+    """
+    for i, (
+        track_number,
+        track_title,
+        start_time,
+    ) in enumerate(tracks):
+        start_time_ms = time_to_ms(start_time)
+        end_time_ms = time_to_ms(tracks[i + 1][2]) if i + 1 < len(tracks) else len(audio)
+
+        logger.info(f"Processing track {track_number}: {track_title}")
+
+        # Extract track audio segment
+        track_audio = audio[start_time_ms:end_time_ms]
+
+        # Export and tag the track
+        track_filename = f"{track_number:02d} - {track_title}.flac"
+        export_and_tag_track(
+            track_audio,
+            track_filename,
+            track_number,
+            track_title,
+            album_artist,
+            album_title,
+            album_date,
+        )
+
+
+def rename_original_files(cue_file, flac_file):
+    """
+    Rename the original CUE and FLAC files by prepending "DeleteMe-".
+
+    Args:
+        cue_file (str): Path to the CUE file.
+        flac_file (str): Path to the FLAC file.
+    """
+    os.rename(cue_file, f"DeleteMe-{cue_file}")
+    os.rename(flac_file, f"DeleteMe-{flac_file}")
+    logger.info(f"Renamed original files to DeleteMe-{cue_file} and DeleteMe-{flac_file}")
+
+
+def split_flac(
+    cue_file,
+    flac_file,
+    album_artist,
+    album_title,
+    album_date,
+    tracks,
+):
+    """
+    Split the FLAC file into individual tracks and tag them.
+
+    Args:
+        cue_file (str): Path to the CUE file.
+        flac_file (str): Path to the FLAC file.
+        album_artist (str): Album artist name.
+        album_title (str): Album title.
+        album_date (str): Album release date.
+        tracks (list): List of tracks with their number, title, and start time.
+    """
+    audio = load_audio(flac_file)
+    process_tracks(
+        audio,
+        tracks,
+        album_artist,
+        album_title,
+        album_date,
+    )
+    rename_original_files(cue_file, flac_file)
+
+
+def main():
+    """
+    Main function to handle the splitting and tagging process.
+    """
+    if len(sys.argv) != 2:
+        logger.error("Usage: script.py <directory>")
+        return
+
+    directory = sys.argv[1]
+
+    if not os.path.isdir(directory):
+        logger.error(f"The directory {directory} does not exist.")
+        return
+
+    os.chdir(directory)
+    print("")
+    logger.info(f"Processing directory: {directory}")
+
+    cue_files = [f for f in os.listdir() if f.endswith(".cue")]
+    flac_files = [f for f in os.listdir() if f.endswith(".flac")]
+
+    if len(cue_files) != 1 or len(flac_files) != 1:
+        logger.error("There must be exactly one CUE file and one FLAC file in the directory.")
+        sys.exit(0)
+
+    cue_file = cue_files[0]
+    flac_file = flac_files[0]
+
+    if cue_file.startswith("DeleteMe-") or flac_file.startswith("DeleteMe-"):
+        logger.error("CUE or FLAC file name already begins with 'DeleteMe-'")
+        logger.info("Exiting the script.")
+        return
+
+    logger.info(f"Using CUE file: {cue_file}")
+    logger.info(f"Using FLAC file: {flac_file}")
+
+    (
+        album_artist,
+        album_title,
+        album_date,
+        tracks,
+    ) = parse_cue_file(cue_file)
+
+    logger.info(f"    Album Artist: {album_artist}")
+    logger.info(f"    Album Title: {album_title}")
+    logger.info(f"    Album Date: {album_date}")
+
+    split_flac(
+        cue_file,
+        flac_file,
+        album_artist,
+        album_title,
+        album_date,
+        tracks,
+    )
+
+
+if __name__ == "__main__":
+    main()

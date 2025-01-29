@@ -1,0 +1,107 @@
+#!/usr/bin/env python3
+
+"""
+This script adds tracks to a specified Spotify playlist.
+
+Environment Variables:
+- SPOTIFY_CLIENT_ID: Your Spotify client ID.
+- SPOTIFY_CLIENT_SECRET: Your Spotify client secret.
+
+Usage:
+1. Set the required environment variables:
+    export SPOTIFY_CLIENT_ID=your_client_id
+    export SPOTIFY_CLIENT_SECRET=your_client_secret
+2. Run the script with the playlist ID or URL as an argument:
+    ./add_spotify_tracks --playlist <playlist_id_or_url>
+3. Enter track URLs or URIs, one per line. Press Enter on an empty line to finish.
+
+Example:
+    ./add_spotify_tracks --playlist https://open.spotify.com/playlist/6pfn3u4v8dFwAKGCpZc0lF
+"""
+
+import sys
+import os
+import argparse
+from urllib.parse import urlparse, parse_qs
+import spotipy
+from spotipy.oauth2 import SpotifyOAuth
+
+
+def parse_arguments():
+    parser = argparse.ArgumentParser(description="Add tracks to a Spotify playlist.")
+    parser.add_argument("--playlist", required=True, help="Spotify Playlist ID or URL")
+    return parser.parse_args()
+
+
+def read_track_urls():
+    print("Please enter the track URLs (one per line), followed by an empty line to end input:")
+    tracks = []
+    for line in sys.stdin:
+        if line.strip() == "":
+            break
+        tracks.append(line.strip())
+    return tracks
+
+
+def extract_id(url_or_uri):
+    if url_or_uri.startswith("http"):
+        parsed_url = urlparse(url_or_uri)
+        item_id = parsed_url.path.split("/")[-1]
+        # Remove any query parameters
+        item_id = item_id.split("?")[0]
+        return item_id
+    elif url_or_uri.startswith("spotify:"):
+        return url_or_uri.split(":")[-1]
+    else:
+        return url_or_uri
+
+
+def get_playlist_track_ids(sp, playlist_id):
+    results = sp.playlist_tracks(playlist_id)
+    tracks = results["items"]
+    while results["next"]:
+        results = sp.next(results)
+        tracks.extend(results["items"])
+    return [item["track"]["id"] for item in tracks]
+
+
+def main():
+    args = parse_arguments()
+
+    client_id = os.getenv("SPOTIFY_CLIENT_ID")
+    client_secret = os.getenv("SPOTIFY_CLIENT_SECRET")
+
+    if not client_id or not client_secret:
+        print("Error: Spotify credentials (SPOTIFY_CLIENT_ID and SPOTIFY_CLIENT_SECRET) are required.")
+        sys.exit(1)
+
+    track_urls = read_track_urls()
+    playlist_id = extract_id(args.playlist)
+    track_ids = [extract_id(url) for url in track_urls]
+
+    sp = spotipy.Spotify(
+        auth_manager=SpotifyOAuth(
+            client_id=client_id,
+            client_secret=client_secret,
+            redirect_uri="http://localhost/",
+            scope="playlist-modify-public playlist-modify-private",
+        )
+    )
+
+    existing_track_ids = get_playlist_track_ids(sp, playlist_id)
+    new_track_ids = [track_id for track_id in track_ids if track_id not in existing_track_ids]
+
+    for track_id in track_ids:
+        if track_id in existing_track_ids:
+            print(f"SKIPPED : {track_id}")
+        else:
+            print(f"ADDED   : {track_id}")
+
+    if new_track_ids:
+        sp.playlist_add_items(playlist_id=playlist_id, items=new_track_ids)
+    else:
+        print("No new tracks to add.")
+
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,93 @@
+#!/usr/bin/env python3
+
+# Deduplicate a directory of files based on their CRC32 hash
+# Usage: ./deduplicate_crc32 source_dir destination_dir
+
+import os
+import zlib
+import shutil
+import argparse
+from collections import defaultdict
+
+
+def compute_crc32(file_path, buffer_size=65536):
+    """
+    Compute CRC32 hash for the given file.
+    """
+    crc = 0
+    try:
+        with open(file_path, "rb") as f:
+            while chunk := f.read(buffer_size):
+                crc = zlib.crc32(chunk, crc)
+    except Exception as e:
+        print(f"Error reading {file_path}: {e}")
+        return None
+    return format(crc & 0xFFFFFFFF, "08x")  # Return as zero-padded hex
+
+
+def deduplicate_files(source_dir, dest_dir):
+    """
+    Deduplicate files in source_dir based on CRC32 hash and copy unique files to dest_dir.
+    """
+    if not os.path.isdir(source_dir):
+        print(f"Source directory '{source_dir}' does not exist or is not a directory.")
+        return
+
+    os.makedirs(dest_dir, exist_ok=True)
+
+    hash_to_files = defaultdict(list)
+
+    print("Scanning files and computing CRC32 hashes...")
+    # Walk through the source directory
+    for root, dirs, files in os.walk(source_dir):
+        for filename in files:
+            file_path = os.path.join(root, filename)
+            crc32 = compute_crc32(file_path)
+            if crc32:
+                hash_to_files[crc32].append(file_path)
+
+    print("Identifying unique files based on CRC32 and filename sorting...")
+    unique_files = []
+    for crc, file_list in hash_to_files.items():
+        # Sort the file list based on filename lex order
+        sorted_files = sorted(file_list, key=lambda x: os.path.basename(x))
+        # Keep the first file (lowest sorted filename)
+        unique_files.append(sorted_files[0])
+
+    print(f"Total unique files to copy: {len(unique_files)}")
+
+    # Copy unique files to the destination directory, preserving directory structure
+    for src_file in unique_files:
+        # Determine relative path
+        rel_path = os.path.relpath(src_file, source_dir)
+        dest_file = os.path.join(dest_dir, rel_path)
+        dest_file_dir = os.path.dirname(dest_file)
+        os.makedirs(dest_file_dir, exist_ok=True)
+        try:
+            shutil.copy2(src_file, dest_file)
+            print(f"Copied: {src_file} -> {dest_file}")
+        except Exception as e:
+            print(f"Error copying {src_file} to {dest_file}: {e}")
+
+    print("Deduplication and copying completed successfully.")
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="Deduplicate files based on CRC32 hash and copy unique files to a new directory."
+    )
+    parser.add_argument(
+        "source", help="Path to the source directory containing files to deduplicate."
+    )
+    parser.add_argument(
+        "destination",
+        help="Path to the destination directory where unique files will be copied.",
+    )
+
+    args = parser.parse_args()
+
+    deduplicate_files(args.source, args.destination)
+
+
+if __name__ == "__main__":
+    main()

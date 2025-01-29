@@ -1,0 +1,35 @@
+#!/bin/bash
+
+# Invalidate all your CloudFront distributions at once
+
+# If AWS_PROFILE is set to this value, the user will not be prompted before invalidation occurs
+SILENT_PROFILE="personal"
+
+aws --version &>/dev/null || { echo "aws: command not found"; exit 1; }
+
+# Fetch list of CloudFront distribution IDs
+distribution_ids=$(aws cloudfront list-distributions --no-cli-pager --output text --query 'DistributionList.Items[*].Id' )
+
+# If I am not on my whitelisted profile, prompt for confirmation
+if [[ "$AWS_PROFILE" != "$SILENT_PROFILE" ]]; then
+    echo "List of CloudFront Distribution IDs:"
+    echo "$distribution_ids"
+    read -p "Press Enter to invalidate all the CloudFront distributions in AWS_PROFILE=$AWS_PROFILE"
+fi
+
+# Loop through each distribution ID and invalidate all paths
+if [[ -n "$distribution_ids" ]]; then
+    for id in $distribution_ids
+    do
+        result=$(aws cloudfront create-invalidation --no-cli-pager --distribution-id $id --paths "/*" 2>&1)
+        if [[ "$result" == *"{"* ]]; then
+            echo $result | jq -c .
+        else
+            echo "Invalidation for distribution $id failed or produced no output: $result"
+        fi
+    done
+else
+    echo "No CloudFront distributions found to invalidate."
+fi
+
+echo "Done."

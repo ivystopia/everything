@@ -1,0 +1,123 @@
+#! /usr/bin/python
+
+"""
+qBittorrent script to remove non-working trackers from torrents
+Requires qBittorrent's Web UI to be enabled.
+"""
+
+import requests
+
+# Configuration Options
+IGNORE_INVALID_SSL = False  # Set to True to ignore invalid SSL certificates
+IGNORE_PRIVATE_TORRENTS = True  # Set to False to include private torrents
+
+try:
+    # Prompt for qBittorrent Web UI details
+    qbittorrent_url = input(
+        "Enter qBittorrent Web UI URL (e.g., https://localhost:8080): "
+    )
+    username = input("Enter qBittorrent username: ")
+    import getpass
+
+    password = getpass.getpass("Enter qBittorrent password: ")
+except KeyboardInterrupt:
+    print("\nOperation cancelled by user.")
+    exit(1)
+
+# Create a session to manage cookies
+session = requests.Session()
+session.verify = not IGNORE_INVALID_SSL  # Apply SSL verification setting
+
+try:
+    # Log in to qBittorrent
+    login_payload = {"username": username, "password": password}
+    response = session.post(f"{qbittorrent_url}/api/v2/auth/login", data=login_payload)
+    if response.status_code != 200 or response.text != "Ok.":
+        print("Login failed")
+        exit(1)
+
+    # Get the list of all torrents
+    response = session.get(f"{qbittorrent_url}/api/v2/torrents/info")
+    if response.status_code != 200:
+        print("Failed to fetch torrents")
+        exit(1)
+
+    torrents = response.json()
+    actions_performed = 0
+
+    # Iterate through each torrent
+    for torrent in torrents:
+        hash = torrent["hash"]
+        name = torrent["name"]
+
+        # Check if the torrent is private
+        if IGNORE_PRIVATE_TORRENTS and torrent.get("is_private", False):
+            print(f"Skipping private torrent: {name}")
+            continue
+
+        # Get the list of trackers for the current torrent
+        response = session.get(
+            f"{qbittorrent_url}/api/v2/torrents/trackers", params={"hash": hash}
+        )
+        if response.status_code != 200:
+            print(f"Failed to fetch trackers for torrent: {name}")
+            continue
+
+        trackers = response.json()
+
+        # Identify non-working trackers
+        non_working_trackers = [
+            tracker for tracker in trackers if tracker["status"] == 4
+        ]  # status 4 indicates 'Not working'
+
+        # Remove non-working trackers
+        for tracker in non_working_trackers:
+            tracker_url = tracker["url"]
+            print(f"Removing tracker {tracker_url} from torrent {name}")
+            actions_performed += 1
+
+            # Attempt to remove the tracker
+            response = session.post(
+                f"{qbittorrent_url}/api/v2/torrents/removeTrackers",
+                data={"hash": hash, "urls": tracker_url},
+            )
+            if response.status_code != 200:
+                print(f"Failed to remove tracker {tracker_url} from torrent {name}")
+                continue
+
+            # Verify removal
+            response = session.get(
+                f"{qbittorrent_url}/api/v2/torrents/trackers", params={"hash": hash}
+            )
+            if response.status_code != 200:
+                print(f"Failed to re-check trackers for torrent: {name}")
+                continue
+
+            updated_trackers = response.json()
+            if any(t["url"] == tracker_url for t in updated_trackers):
+                print(
+                    f"Tracker {tracker_url} still exists for torrent {name}, retrying..."
+                )
+                response = session.post(
+                    f"{qbittorrent_url}/api/v2/torrents/removeTrackers",
+                    data={"hash": hash, "urls": tracker_url},
+                )
+                if response.status_code != 200:
+                    print(f"Retry failed for tracker {tracker_url} on torrent {name}")
+
+    # Log out from qBittorrent
+    session.post(f"{qbittorrent_url}/api/v2/auth/logout")
+
+    if actions_performed == 0:
+        print(
+            "No actions were performed. All trackers are functional or private torrents were skipped."
+        )
+
+except requests.exceptions.ConnectionError:
+    print(
+        f"Failed to connect to qBittorrent at {qbittorrent_url}. Check if the Web UI is enabled and reachable."
+    )
+    exit(1)
+except Exception as e:
+    print(f"An unexpected error occurred: {e}")
+    exit(1)
